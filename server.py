@@ -8,18 +8,22 @@ import re
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageDraw, ImageFont
+from drama.wan22 import Wan22, Unavailable
+from drama.jobs import Jobs, Busy
+from drama.pipeline import casting
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / 'web'
 EXPORTS = ROOT / 'exports'
 EXPORTS.mkdir(exist_ok=True)
+ENGINE = Wan22()
+JOBS = Jobs(ENGINE, EXPORTS)
 FONT_CANDIDATES = [
     '/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf',
     '/usr/share/fonts/truetype/nanum/NanumSquareB.ttf',
@@ -74,6 +78,9 @@ def make_frame(path, scene, idx, total, title, country, actors):
     base.save(path)
 
 def render_video(data):
+    if not isinstance(data, dict):
+        raise ValueError('JSON 객체가 필요합니다.')
+    cast = casting(data)
     if shutil.which('ffmpeg') is None:
         raise RuntimeError('FFmpeg를 찾을 수 없습니다. 설치하고 PATH에 추가하세요.')
     scenes=data.get('scenes')
@@ -86,7 +93,7 @@ def render_video(data):
         raise ValueError('장면 길이는 2~12초로 지정하세요.')
     title=str(data.get('title','D AI Drama'))[:100]
     country=str(data.get('country','한국'))[:30]
-    actors=str(data.get('actors','남자 주인공 183cm'))[:120]
+    actors=f"{cast['maleLead']['name']} 183cm / {cast['femaleLead']['name']}"
     job=uuid.uuid4().hex[:12]
     output=EXPORTS/f'{job}.mp4'
     with tempfile.TemporaryDirectory(prefix='drama_') as temp:
@@ -117,6 +124,11 @@ class Handler(BaseHTTPRequestHandler):
         self.response(status,json.dumps(payload,ensure_ascii=False).encode('utf-8'))
     def do_GET(self):
         path=unquote(urlparse(self.path).path)
+        if path == '/api/capabilities':
+            self.json_response(200, {'wan22': ENGINE.status(), 'storyboard': bool(shutil.which('ffmpeg'))});return
+        if re.fullmatch(r'/api/jobs/[a-f0-9]{12}', path):
+            job = JOBS.get(path.rsplit('/', 1)[1])
+            self.json_response(200 if job else 404, job or {'error': 'Job not found'});return
         if path in ('/','/index.html'):
             file=WEB/'index.html';mime='text/html; charset=utf-8'
         elif re.fullmatch(r'/exports/[a-f0-9]{12}\.mp4',path):
@@ -127,19 +139,39 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(404,{'error':'File not found'});return
         self.response(200,file.read_bytes(),mime)
     def do_POST(self):
-        if urlparse(self.path).path!='/api/render':
-            self.json_response(404,{'error':'Not found'});return
+        path = urlparse(self.path).path
+        if path not in ('/api/render', '/api/generate'):
+            self.json_response(404, {'error': 'Not found'});return
+        # Prevent other origins from starting expensive local generation.
+        origin = self.headers.get('Origin')
+        if origin and origin != 'http://' + self.headers.get('Host', ''):
+            self.json_response(403, {'error': 'Origin not allowed'});return
         try:
-            size=int(self.headers.get('Content-Length','0'))
-            if not (0<size<=100_000):
-                self.json_response(413,{'error':'요청 크기가 너무 큽니다.'});return
-            data=json.loads(self.rfile.read(size))
-            name=render_video(data)
-            self.json_response(200,{'videoUrl':'/exports/'+name,'message':'스토리보드 MP4 생성 완료'})
-        except (ValueError,RuntimeError,subprocess.TimeoutExpired) as err:
-            self.json_response(400,{'error':str(err)})
+            size = int(self.headers.get('Content-Length', '0'))
+            limit = 8_100_000 if path == '/api/generate' else 100_000
+            if not 0 < size <= limit:
+                self.json_response(413, {'error': '요청 크기가 너무 큽니다.'});return
+            data = json.loads(self.rfile.read(size))
+            if not isinstance(data, dict):
+                raise ValueError('JSON 객체가 필요합니다.')
+            if path == '/api/generate':
+                spec, image = ENGINE.validate(data)
+                status = ENGINE.status()
+                if not status['ready']:
+                    raise Unavailable(' '.join(status['reasons']))
+                job = JOBS.submit(spec, image)
+                self.json_response(202, {'id': job, 'statusUrl': '/api/jobs/' + job})
+            else:
+                name = render_video(data)
+                self.json_response(200, {'videoUrl': '/exports/' + name, 'message': '스토리보드 MP4 생성 완료'})
+        except Unavailable as err:
+            self.json_response(503, {'error': str(err)})
+        except Busy as err:
+            self.json_response(409, {'error': str(err)})
+        except (ValueError, RuntimeError, subprocess.TimeoutExpired) as err:
+            self.json_response(400, {'error': str(err)})
         except Exception as err:
-            self.json_response(500,{'error':f'서버 오류: {type(err).__name__}'})
+            self.json_response(500, {'error': f'서버 오류: {type(err).__name__}'})
 
 if __name__=='__main__':
     host='127.0.0.1';port=int(os.getenv('DRAMA_PORT','8765'))
